@@ -13,13 +13,20 @@ genai.configure(api_key=api_key)
 # --- FERRAMENTAS (TOOLS) QUE A IA VAI OPERAR ---
 
 def buscar_info_gerais(empresa_id: int):
-    """
-    OBRIGATÓRIO: Use isso no início para conhecer barbeiros, serviços e preços.
-    """
     pros = supabase.table("profissionais").select("id, nome").eq("empresa_id", empresa_id).execute()
-    servs = supabase.table("servicos").select("id, nome, preco").eq("empresa_id", empresa_id).execute()
-    return {"barbeiros": pros.data, "servicos": servs.data}
-
+    servs = supabase.table("servicos").select("id, nome, preco, duracao_minutos").eq("empresa_id", empresa_id).execute()
+    
+    # Lógica para facilitar a vida da IA
+    qtd_barbeiros = len(pros.data)
+    so_tem_um = qtd_barbeiros == 1
+    
+    return {
+        "barbeiros": pros.data, 
+        "servicos": servs.data,
+        "so_tem_um_barbeiro": so_tem_um,
+        "nome_unico_barbeiro": pros.data[0]['nome'] if so_tem_um else None,
+        "id_unico_barbeiro": pros.data[0]['id'] if so_tem_um else None
+    }
 def verificar_disponibilidade_total(empresa_id: int, profissional_id: int, servico_id: int, data_hora_iso: str):
     # 1. Pegamos a duração do serviço escolhido
     servico = supabase.table("servicos").select("duracao_minutos").eq("id", servico_id).single().execute()
@@ -83,6 +90,33 @@ def verificar_expediente(empresa_id: int, data_hora_iso: str):
         return f"Fora do expediente. Abrimos às {abertura.strftime('%H:%M')} e fechamos às {fechamento.strftime('%H:%M')}."
 
     return "Dentro do expediente"
+def recuperar_historico(empresa_id: int, whatsapp_cliente: str, limite: int = 10):
+    try:
+        res = supabase.table("historico_mensagens")\
+            .select("role, content")\
+            .eq("empresa_id", empresa_id)\
+            .eq("whatsapp_cliente", whatsapp_cliente)\
+            .order("created_at", desc=True)\
+            .limit(limite)\
+            .execute()
+        
+        # Invertemos para enviar ao Gemini na ordem cronológica correta (antiga -> nova)
+        return [{"role": m['role'], "parts": [m['content']]} for m in reversed(res.data)]
+    except Exception as e:
+        logger.error(f"Erro ao recuperar histórico: {e}")
+        return [] # Se falhar, a IA começa sem contexto, mas não trava o chat
+
+def salvar_no_historico(empresa_id: int, whatsapp_cliente: str, role: str, conteudo: str):
+    try:
+        data = {
+            "empresa_id": empresa_id,
+            "whatsapp_cliente": whatsapp_cliente,
+            "role": role,
+            "content": conteudo
+        }
+        supabase.table("historico_mensagens").insert(data).execute()
+    except Exception as e:
+        logger.error(f"Erro ao salvar mensagem ({role}): {e}")
 
 def listar_horarios_livres(empresa_id: int, profissional_id: int, servico_id: int, data_iso: str):
     """
@@ -186,29 +220,52 @@ def processar_mensagem_cliente(empresa_id: int, whatsapp_cliente: str, mensagem:
     # Busca os dados da empresa para personalizar o atendimento
     res = supabase.table("empresas").select("*").eq("id", empresa_id).single().execute()
     emp = res.data
+
+    res_hist = supabase.table("historico_mensagens")\
+        .select("role, content")\
+        .eq("whatsapp_cliente", whatsapp_cliente)\
+        .eq("empresa_id", empresa_id)\
+        .order("created_at", desc=True)\
+        .limit(10)\
+        .execute()
+    
+    # O Gemini espera o histórico do mais antigo para o mais novo, então invertemos
+    historico_formatado = []
+    for msg in reversed(res_hist.data):
+        historico_formatado.append({"role": msg['role'], "parts": [msg['content']]})
     
     # Extração de variáveis do banco para o prompt
     cidade = emp.get('cidade', 'Brasil')
     estilo = emp.get('ia_estilo', 'Profissional')
     nome_ia = emp.get('ia_nome', 'Assistente')
+    segmento = emp.get('segmento', 'Salão')
 
     prompt_final = f"""
-    Você é {nome_ia}, assistente do salão {emp['nome']} em {cidade}.
+    Você é {nome_ia}, assistente inteligente de um(a) {segmento} chamado {emp['nome']} em {cidade}.
     O cliente com quem você fala tem o WhatsApp: {whatsapp_cliente}.
+    Data e hora atual: {datetime.now().strftime('%d/%m/%Y %H:%M')}
 
     INSTRUÇÃO DE LINGUAGEM:
-    - Se {estilo} for 'Engraçado', use um tom bem-humorado e brincalhão.
-    - Se {estilo} for 'Sério', seja direto, formal e evite gracinhas.
-    - Se {estilo} for 'Profissional', seja cordial, educado e eficiente.
+    - Seu tom é {estilo}. 
+    - Se 'Engraçado', seja resenheiro e brincalhão, Use gírias e o sotaque de {cidade} de forma natural.
+    - Se 'Sério', seja direto e formal.
+    - Se 'Profissional', seja cordial e eficiente.
 
-    AÇÕES POSSÍVEIS:
-    1. AGENDAR: Use 'buscar_info_gerais' -> 'verificar_disponibilidade_total' -> 'salvar_agendamento'.
-    2. CANCELAR: Use 'cancelar_agendamento_cliente' passando o whatsapp: {whatsapp_cliente}.
-    3. SUGERIR: Se o horário estiver ocupado, use 'listar_horarios_livres'.
+    LÓGICA DE ATENDIMENTO (Fluxo de Agendamento):
+    1. Sempre comece usando 'buscar_info_gerais' para conhecer os serviços e barbeiros disponíveis.
+    2. SE HOUVER APENAS 1 PROFISSIONAL: Não pergunte com quem o cliente quer cortar. Confirme o atendimento com ele de forma direta (Ex: "O serviço vai ser com {{nome}}, beleza?").
+    3. SE HOUVER MAIS DE 1 PROFISSIONAL: Apresente as opções e pergunte a preferência do cliente.
+    4. Antes de agendar, você PRECISA de: Nome do Cliente, Serviço, Barbeiro e Data/Hora.
 
-    REGRAS DE MEMÓRIA:
-    - Verifique o histórico de mensagens para saber se o cliente já mencionou um serviço ou barbeiro antes de perguntar novamente.
-    - Se o cliente disser 'quero cancelar o meu', chame a função de cancelamento sem pedir o ID primeiro.
+    AÇÕES E TOOLS:
+    - AGENDAR: 'buscar_info_gerais' -> 'verificar_disponibilidade_total' -> 'salvar_agendamento'.
+    - CANCELAR: Use 'cancelar_agendamento_cliente' sempre usando o whatsapp: {whatsapp_cliente}.
+    - INDISPONIBILIDADE: Se o horário escolhido estiver ocupado, use 'listar_horarios_livres' para sugerir alternativas próximas.
+
+    REGRAS DE MEMÓRIA E UX:
+    - SEMPRE consulte o histórico. Se o cliente já disse o nome ou o serviço em mensagens anteriores, não pergunte de novo.
+    - Se o cliente quiser cancelar, não peça o ID do agendamento. Tente cancelar direto pelo WhatsApp dele.
+    - Seja proativo: se ele perguntar o preço, já mencione a duração do serviço.
     """
 
     model = genai.GenerativeModel(
@@ -224,10 +281,24 @@ def processar_mensagem_cliente(empresa_id: int, whatsapp_cliente: str, mensagem:
     )
 
     # Inicia o chat com o histórico vindo do banco/webhook
-    chat = model.start_chat(history=historico, enable_automatic_function_calling=True)
+    chat = model.start_chat(history=historico_formatado, enable_automatic_function_calling=True)
     response = chat.send_message(mensagem)
+    resposta_texto = response.text
     
-    return {
-        "resposta": response.text, 
-        "historico": chat.history # Salve isso no seu banco de conversas!
-    }
+    supabase.table("historico_mensagens").insert({
+        "empresa_id": empresa_id,
+        "whatsapp_cliente": whatsapp_cliente,
+        "role": "user",
+        "content": mensagem
+    }).execute()
+
+    # Salva o que a IA respondeu
+    
+    supabase.table("historico_mensagens").insert({
+        "empresa_id": empresa_id,
+        "whatsapp_cliente": whatsapp_cliente,
+        "role": "model",
+        "content": resposta_texto
+    }).execute()
+
+    return {"resposta": resposta_texto}

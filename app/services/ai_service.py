@@ -9,7 +9,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuração
-genai.configure(api_key="AIzaSyAlB43A6CEp98APORF4pSQzj0umGVkDx40")
+api_key = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=api_key)
 
 
 
