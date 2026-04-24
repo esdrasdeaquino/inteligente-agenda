@@ -77,7 +77,7 @@ def processar_mensagem_admin(empresa_id: int, mensagem: str, historico: list = [
 
     # Prompt focado em GESTÃO e OPERAÇÃO
     prompt_admin = f"""
-    Você é o Assistente de Gestão do salão {emp['nome']}.
+    Você é o Assistente de Gestão do salão {emp['nome_empresa']}.
     Sua função é ajudar o dono a controlar o negócio. Seja direto, eficiente e analítico.
 
     COMANDOS DE GESTOR:
